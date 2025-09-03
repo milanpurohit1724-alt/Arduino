@@ -1,0 +1,236 @@
+// --- Header Files ---
+#include <Adafruit_BMP085.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <DHT_U.h>
+#include "Arduino_LED_Matrix.h"
+#include "WiFiS3.h"
+
+// --- Pin Definitions ---
+#define Rain_SensorPin 3
+#define Air_SensorPin A0
+#define Temp_Hum_SensorPin 2
+
+// --- Sensor, WiFi, and LED Matrix Objects ---
+DHT_Unified dht(Temp_Hum_SensorPin, DHT11);
+Adafruit_BMP085 bmp;
+WiFiServer server(80);
+ArduinoLEDMatrix matrix;
+
+// --- WiFi Credentials ---
+char ssid[] = "Redmi Note 14 Pro 5G";
+char pass[] = "ritvikdeep";
+
+// --- Global Variables ---
+float temperature = 0.0, humidity = 0.0, pressure = 0.0;
+int AQI = 0, rainfall = 0;
+unsigned long lastSensorUpdate = 0;
+unsigned long lastWiFiCheck = 0;
+
+// --- LED Matrix Icons ---
+const uint32_t wifi_connected[] = {
+  0x3f840, 0x49f22084, 0xe4110040
+};
+const uint32_t no_wifi[] = {
+  0x403f844, 0x49f22484, 0xe4110040
+};
+
+// --- WiFi Connect Function ---
+void wifi_connect() {
+  if (WiFi.status() == WL_NO_MODULE) {
+    Serial.println("WiFi module failed!");
+    matrix.loadFrame(no_wifi);
+    while (true);
+  }
+
+  Serial.print("Connecting to WiFi...");
+  matrix.loadSequence(LEDMATRIX_ANIMATION_WIFI_SEARCH);
+  matrix.play(true);
+  delay(6000);
+
+  while (WiFi.begin(ssid, pass) != WL_CONNECTED) {
+    Serial.print(".");
+    delay(1000);
+  }
+
+  matrix.loadFrame(wifi_connected);
+  Serial.println("\nConnected!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// --- WiFi Reconnect Function ---
+void wifi_reconnect() {
+  Serial.println("Reconnecting WiFi...");
+  matrix.loadFrame(no_wifi);
+  delay(6000);
+  wifi_connect();
+}
+
+// --- Read Sensor Data ---
+void read_sensor_data() {
+  sensors_event_t event;
+
+  dht.temperature().getEvent(&event);
+  temperature = event.temperature;
+
+  dht.humidity().getEvent(&event);
+  humidity = event.relative_humidity;
+
+  pressure = bmp.readPressure() / 100.0; // Convert Pa to mbar
+
+  int mq135Raw = analogRead(Air_SensorPin);
+  float mq135PPM = mq135Raw * (5.0 / 1023.0) * 200.0;
+  AQI = map(mq135PPM, 0, 500, 0, 300);
+
+  rainfall = digitalRead(Rain_SensorPin) == HIGH ? 0 : 1;
+
+  Serial.println("------ SENSOR DATA ------");
+  Serial.print("Temp: "); Serial.println(temperature);
+  Serial.print("Humidity: "); Serial.println(humidity);
+  Serial.print("Pressure: "); Serial.println(pressure);
+  Serial.print("AQI: "); Serial.println(AQI);
+  Serial.print("Rainfall: "); Serial.println(rainfall);
+  Serial.println("-------------------------");
+}
+
+// --- Send JSON Data to Client ---
+void send_json_data(WiFiClient &client) {
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: application/json");
+  client.println("Connection: close");
+  client.println();
+
+  String json = "{\"temperature\":" + String(temperature) +
+                ",\"humidity\":" + String(humidity) +
+                ",\"pressure\":" + String(pressure) +
+                ",\"aqi\":" + String(AQI) +
+                ",\"rainfall\":" + String(rainfall) + "}";
+
+  client.println(json);
+}
+
+// --- Serve Web Page to Client ---
+void send_web_page(WiFiClient &client) {
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println("Connection: close");
+  client.println();
+
+  const char* html = R"rawliteral(
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='UTF-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0'>
+<title>Weather Dashboard</title>
+<style>
+body { font-family: Arial; background: #f4f4f4; text-align: center; padding: 20px; }
+h1 { color: #0077cc; }
+.data-container { display: flex; flex-direction: column; gap: 10px; }
+.data-card { background: #fff; padding: 15px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+.graph { margin-top: 15px; }
+canvas { width: 100%; height: 400px; }
+</style>
+</head>
+<body>
+<h1>Weather Dashboard</h1>
+<div id='weather' class='data-container'></div>
+<div class='graph'><canvas id='combinedGraph'></canvas></div>
+<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>
+<script>
+const ctx = document.getElementById('combinedGraph').getContext('2d');
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [
+      { label: 'Temperature (°C)', data: [], borderColor: '#ff5733', fill: true },
+      { label: 'Humidity (%)', data: [], borderColor: '#2196f3', fill: true }
+    ]
+  },
+  options: {
+    responsive: true,
+    animation: false,
+    scales: {
+      y: { beginAtZero: true, max: 100 }
+    }
+  }
+});
+
+function fetchWeatherData() {
+  fetch('/data')
+    .then(res => res.json())
+    .then(data => {
+      document.getElementById('weather').innerHTML = `
+        <div class='data-card'>Temp: ${data.temperature}°C | Humidity: ${data.humidity}%</div>
+        <div class='data-card'>Pressure: ${data.pressure} mbar</div>
+        <div class='data-card'>AQI: ${data.aqi} | Rainfall: ${data.rainfall ? 'Yes' : 'No'}</div>
+      `;
+      let time = new Date().toLocaleTimeString();
+      chart.data.labels.push(time);
+      chart.data.datasets[0].data.push(data.temperature);
+      chart.data.datasets[1].data.push(data.humidity);
+      if (chart.data.labels.length > 10) {
+        chart.data.labels.shift();
+        chart.data.datasets[0].data.shift();
+        chart.data.datasets[1].data.shift();
+      }
+      chart.update();
+    });
+}
+setInterval(fetchWeatherData, 1000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+  client.print(html);
+}
+
+// --- Web Server Handler ---
+void run_local_webserver() {
+  WiFiClient client = server.available();
+  if (client) {
+    String request = client.readStringUntil('\r');
+    client.flush();
+    if (request.indexOf("GET / ") != -1 || request.indexOf("GET /") != -1) {
+      send_web_page(client);
+    } else if (request.indexOf("GET /data") != -1) {
+      send_json_data(client);
+    }
+    client.stop();
+  }
+}
+
+// --- Setup Function ---
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+  bmp.begin();
+  matrix.begin();
+  wifi_connect();
+  server.begin();
+}
+
+// --- Main Loop ---
+void loop() {
+  run_local_webserver();
+
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - lastSensorUpdate >= 1000) {
+    read_sensor_data();
+    lastSensorUpdate = currentMillis;
+  }
+
+  if (currentMillis - lastWiFiCheck >= 10000) {
+    if (WiFi.status() != WL_CONNECTED) {
+      wifi_reconnect();
+    }
+    lastWiFiCheck = currentMillis;
+  }
+}
+
+
+
